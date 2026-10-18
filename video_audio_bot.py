@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import uuid
@@ -19,12 +20,11 @@ from telegram.ext import (
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Render injects these two automatically — no need to set them yourself
-RENDER_HOST = os.environ["RENDER_EXTERNAL_HOSTNAME"]   # e.g. video-audio-bot.onrender.com
-PORT = int(os.environ.get("PORT", 8443))               # Render assigns a port dynamically
+RENDER_HOST = os.environ["RENDER_EXTERNAL_HOSTNAME"]
+PORT = int(os.environ.get("PORT", 8443))
 
-WEBHOOK_URL = f"https://{RENDER_HOST}/webhook"         # full public URL Telegram will POST to
-WEBHOOK_PATH = "/webhook"                              # local path our server listens on
+WEBHOOK_URL = f"https://{RENDER_HOST}/webhook"
+WEBHOOK_PATH = "/webhook"
 
 DOWNLOAD_DIR = Path("/tmp/vab")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,37 +43,29 @@ URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 # ── URL normalisation ─────────────────────────────────────────────────────────
 
 def normalise_url(url: str) -> str:
-    """Convert Google Drive / Dropbox share links to direct download URLs."""
-    # Google Drive: /file/d/<ID>/view  →  /uc?export=download&id=<ID>
     gd = re.match(r"https://drive\.google\.com/file/d/([^/]+)", url)
     if gd:
         return f"https://drive.google.com/uc?export=download&id={gd.group(1)}"
-
-    # Dropbox: ?dl=0  →  ?dl=1
     if "dropbox.com" in url:
         return re.sub(r"[?&]dl=0", "?dl=1", url)
-
     return url
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def parse_timestamp(ts: str) -> str:
-    """Accept HH:MM:SS or MM:SS — ffmpeg handles both natively."""
     if re.fullmatch(r"(\d{1,2}:)?\d{1,2}:\d{2}(\.\d+)?", ts):
         return ts
     raise ValueError(f"Invalid timestamp: {ts!r}")
 
 
 def run_ffmpeg(*args: str) -> tuple[bool, str]:
-    """Run an ffmpeg command. Returns (success, stderr)."""
     cmd = ["ffmpeg", "-y", *args]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0, result.stderr
 
 
 def get_metadata(video_path: Path) -> str:
-    """Return a human-readable metadata string via ffprobe."""
     cmd = [
         "ffprobe", "-v", "quiet",
         "-print_format", "json",
@@ -128,7 +120,6 @@ def get_metadata(video_path: Path) -> str:
 
 
 async def download_from_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Path | None:
-    """Download a video attached to a Telegram message (≤20 MB)."""
     msg = update.effective_message
     video = msg.video or msg.document
 
@@ -152,10 +143,8 @@ async def download_from_telegram(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def download_from_url(url: str, msg) -> Path | None:
-    """Stream-download a video from a URL into /tmp. Returns path or None."""
     direct_url = normalise_url(url)
     video_path = DOWNLOAD_DIR / f"{uuid.uuid4().hex}.mp4"
-
     status = await msg.reply_text("⏳ Downloading from URL…")
 
     try:
@@ -168,9 +157,7 @@ async def download_from_url(url: str, msg) -> Path | None:
                     size_mb = int(content_length) / (1024 * 1024)
                     if size_mb > MAX_URL_FILE_SIZE_MB:
                         await status.delete()
-                        await msg.reply_text(
-                            f"⚠️ File is {size_mb:.0f} MB — limit is {MAX_URL_FILE_SIZE_MB} MB."
-                        )
+                        await msg.reply_text(f"⚠️ File is {size_mb:.0f} MB — limit is {MAX_URL_FILE_SIZE_MB} MB.")
                         return None
 
                 downloaded = 0
@@ -180,18 +167,13 @@ async def download_from_url(url: str, msg) -> Path | None:
                         downloaded += len(chunk)
                         if downloaded > MAX_URL_FILE_SIZE_MB * 1024 * 1024:
                             await status.delete()
-                            await msg.reply_text(
-                                f"⚠️ Download exceeded {MAX_URL_FILE_SIZE_MB} MB limit. Stopping."
-                            )
+                            await msg.reply_text(f"⚠️ Download exceeded {MAX_URL_FILE_SIZE_MB} MB limit. Stopping.")
                             video_path.unlink(missing_ok=True)
                             return None
 
     except httpx.HTTPStatusError as e:
         await status.delete()
-        await msg.reply_text(
-            f"❌ Couldn't fetch the file: HTTP {e.response.status_code}.\n"
-            "Make sure the link is public and points to a video."
-        )
+        await msg.reply_text(f"❌ Couldn't fetch the file: HTTP {e.response.status_code}.\nMake sure the link is public.")
         video_path.unlink(missing_ok=True)
         return None
     except Exception as e:
@@ -212,9 +194,7 @@ async def extract_and_send(
     start_ts: str = None,
     end_ts: str = None,
 ) -> None:
-    """Run ffmpeg extraction (with optional trim) and send the MP3."""
     mp3_path = video_path.with_suffix(".mp3")
-
     label = (
         f"✂️ Trimming `{start_ts}` → `{end_ts}` and extracting…"
         if start_ts else "🎵 Extracting audio…"
@@ -263,7 +243,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle a direct video upload."""
     video_path = await download_from_telegram(update, context)
     if not video_path:
         return
@@ -271,13 +250,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle a plain text message containing a URL."""
     msg = update.effective_message
     text = msg.text or ""
     match = URL_PATTERN.search(text)
     if not match:
         return
-
     url = match.group(0)
     video_path = await download_from_url(url, msg)
     if not video_path:
@@ -286,7 +263,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def trim(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reply to a video with /trim <start> <end>."""
     msg = update.effective_message
     replied = msg.reply_to_message
 
@@ -298,10 +274,7 @@ async def trim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(context.args) != 2:
-        await msg.reply_text(
-            "⚠️ Usage: `/trim <start> <end>`\nExample: `/trim 00:30 01:45`",
-            parse_mode="Markdown",
-        )
+        await msg.reply_text("⚠️ Usage: `/trim <start> <end>`\nExample: `/trim 00:30 01:45`", parse_mode="Markdown")
         return
 
     try:
@@ -327,7 +300,6 @@ async def trim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reply to a video with /metadata."""
     msg = update.effective_message
     replied = msg.reply_to_message
 
@@ -346,13 +318,22 @@ async def metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = get_metadata(video_path)
     await status.delete()
     video_path.unlink(missing_ok=True)
-
     await msg.reply_text(info, parse_mode="Markdown")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
+async def main() -> None:
+    """
+    Manually manage the application lifecycle so we control the event loop.
+
+    Why not run_webhook()?
+    ----------------------
+    run_webhook() internally calls asyncio.get_event_loop() which raises
+    RuntimeError on Python 3.10+ when no loop exists yet in the main thread.
+    Instead we use asyncio.run(main()) which creates and owns the loop,
+    then we call the lower-level start/stop methods directly.
+    """
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -363,17 +344,29 @@ def main():
 
     logger.info("Starting webhook on port %s → %s", PORT, WEBHOOK_URL)
 
-    # run_webhook() does three things automatically:
-    # 1. Calls Telegram's setWebhook API with our WEBHOOK_URL
-    # 2. Starts a Tornado HTTP server locally on PORT
-    # 3. Listens on WEBHOOK_PATH for incoming POST requests from Telegram
-    app.run_webhook(
-        listen="0.0.0.0",       # accept connections from anywhere (Render's load balancer)
-        port=PORT,               # the port Render assigned us via $PORT
-        url_path=WEBHOOK_PATH,   # e.g. /webhook
-        webhook_url=WEBHOOK_URL, # full public URL registered with Telegram
-    )
+    async with app:
+        # Register our URL with Telegram
+        await app.bot.set_webhook(
+            url=WEBHOOK_URL,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        # Start the Tornado HTTP server + the PTB dispatcher
+        await app.updater.start_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=WEBHOOK_PATH,
+        )
+        await app.start()
+
+        logger.info("Bot is live. Waiting for updates…")
+
+        # Keep running until the process is killed (e.g. Render stops it)
+        await asyncio.Event().wait()
+
+        # Graceful shutdown
+        await app.updater.stop()
+        await app.stop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())  # This creates the event loop — no more RuntimeError
