@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: video-audio-bot
+    runtime: python
+    buildCommand: bash build.sh
+    startCommand: python video_audio_bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11"
