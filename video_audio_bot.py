@@ -8,21 +8,21 @@ import logging
 from pathlib import Path
 
 import httpx
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-
 RENDER_HOST = os.environ["RENDER_EXTERNAL_HOSTNAME"]
 PORT = int(os.environ.get("PORT", 8443))
-
 WEBHOOK_URL = f"https://{RENDER_HOST}/webhook"
 WEBHOOK_PATH = "/webhook"
 
@@ -38,6 +38,40 @@ logger = logging.getLogger(__name__)
 MAX_TG_FILE_SIZE_MB = 20
 MAX_URL_FILE_SIZE_MB = 500
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+
+# ── Conversation states ───────────────────────────────────────────────────────
+# These are just integers used as labels for each step in the conversation.
+# We define them as constants so the code is readable instead of using
+# magic numbers like 0, 1, 2 everywhere.
+AWAITING_QUALITY = 0
+
+# ── Quality options ───────────────────────────────────────────────────────────
+# Maps callback data string → (display label, ffmpeg -q:a value)
+# ffmpeg's -q:a controls VBR quality: lower = better (0=best, 9=worst)
+# 128kbps ≈ q:a 7 | 192kbps ≈ q:a 4 | 320kbps ≈ q:a 0
+QUALITY_OPTIONS = {
+    "q_128": ("128 kbps", "7"),
+    "q_192": ("192 kbps", "4"),
+    "q_320": ("320 kbps", "0"),
+}
+
+def quality_keyboard() -> InlineKeyboardMarkup:
+    """
+    Build the inline keyboard for quality selection.
+
+    InlineKeyboardMarkup takes a list of rows.
+    Each row is a list of InlineKeyboardButton objects.
+    We put all three buttons in one row here.
+
+    Each button has:
+      text  → what the user sees on the button
+      callback_data → the string sent back to us when they tap it
+    """
+    buttons = [
+        InlineKeyboardButton(label, callback_data=key)
+        for key, (label, _) in QUALITY_OPTIONS.items()
+    ]
+    return InlineKeyboardMarkup([buttons])  # one row of three buttons
 
 
 # ── URL normalisation ─────────────────────────────────────────────────────────
@@ -190,21 +224,31 @@ async def download_from_url(url: str, msg) -> Path | None:
 async def extract_and_send(
     video_path: Path,
     msg,
-    caption: str = "Here's your MP3 🎵",
+    quality_key: str = "q_192",
+    caption_suffix: str = "",
     start_ts: str = None,
     end_ts: str = None,
 ) -> None:
+    """
+    Run ffmpeg and send the MP3.
+
+    quality_key maps to QUALITY_OPTIONS, e.g. "q_192" → q:a value "4"
+    caption_suffix lets callers append extra info (e.g. trim range)
+    """
     mp3_path = video_path.with_suffix(".mp3")
-    label = (
-        f"✂️ Trimming `{start_ts}` → `{end_ts}` and extracting…"
-        if start_ts else "🎵 Extracting audio…"
-    )
-    status = await msg.reply_text(label, parse_mode="Markdown")
+    label, qa_value = QUALITY_OPTIONS.get(quality_key, ("192 kbps", "4"))
+
+    trim_note = f" — trimmed `{start_ts}` → `{end_ts}`" if start_ts else ""
+    status_text = f"🎵 Extracting at *{label}*{trim_note}…"
+    status = await msg.reply_text(status_text, parse_mode="Markdown")
 
     ffmpeg_args = ["-i", str(video_path)]
     if start_ts:
         ffmpeg_args += ["-ss", start_ts, "-to", end_ts]
-    ffmpeg_args += ["-vn", "-acodec", "libmp3lame", "-q:a", "2", str(mp3_path)]
+    # -vn         → strip video stream
+    # -acodec     → encode with LAME MP3
+    # -q:a value  → VBR quality level (0=best/320kbps, 7=~128kbps)
+    ffmpeg_args += ["-vn", "-acodec", "libmp3lame", "-q:a", qa_value, str(mp3_path)]
 
     ok, stderr = run_ffmpeg(*ffmpeg_args)
     await status.delete()
@@ -215,10 +259,10 @@ async def extract_and_send(
         await msg.reply_text("❌ Failed to extract audio. Is this a valid video file?")
         return
 
-    title = f"Trimmed Audio ({start_ts} – {end_ts})" if start_ts else "Extracted Audio"
+    caption = f"🎵 *{label}* MP3{caption_suffix}"
     await msg.reply_audio(
         audio=mp3_path.open("rb"),
-        title=title,
+        title="Extracted Audio",
         caption=caption,
         parse_mode="Markdown",
     )
@@ -233,8 +277,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send or forward any video and I'll extract the audio as an MP3.\n"
         "For videos over 20 MB, send a Google Drive or Dropbox link.\n\n"
         "*Commands:*\n"
-        "• Send a video → full MP3\n"
-        "• Send a URL → download & extract\n"
+        "• Send a video → choose quality → get MP3\n"
+        "• Send a URL → choose quality → get MP3\n"
         "• Reply to a video with `/trim 00:30 01:45` → trimmed MP3\n"
         "• Reply to a video with `/metadata` → video info\n\n"
         "Telegram upload limit: *20 MB* | URL limit: *500 MB*"
@@ -242,25 +286,114 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── ConversationHandler entry points ─────────────────────────────────────────
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Step 1 of the conversation (triggered by receiving a video).
+
+    We download the video, save its path to user_data, then ask
+    the user to pick a quality. Returning AWAITING_QUALITY tells
+    the ConversationHandler to move this user into that state —
+    their next interaction will be handled by handle_quality().
+    """
     video_path = await download_from_telegram(update, context)
     if not video_path:
-        return
-    await extract_and_send(video_path, update.effective_message)
+        return ConversationHandler.END  # abort if download failed
+
+    # Store the path as a string — user_data must be serialisable
+    context.user_data["pending_video"] = str(video_path)
+    context.user_data["pending_source"] = "telegram"
+
+    await update.effective_message.reply_text(
+        "🎵 What quality do you want?",
+        reply_markup=quality_keyboard(),
+    )
+    return AWAITING_QUALITY  # move to next state
 
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Step 1 of the conversation (triggered by receiving a URL).
+    Same pattern as handle_video — download first, ask quality second.
+    """
     msg = update.effective_message
     text = msg.text or ""
     match = URL_PATTERN.search(text)
     if not match:
-        return
+        return ConversationHandler.END
+
     url = match.group(0)
     video_path = await download_from_url(url, msg)
     if not video_path:
-        return
-    await extract_and_send(video_path, msg)
+        return ConversationHandler.END
 
+    context.user_data["pending_video"] = str(video_path)
+    context.user_data["pending_source"] = "url"
+
+    await msg.reply_text(
+        "🎵 What quality do you want?",
+        reply_markup=quality_keyboard(),
+    )
+    return AWAITING_QUALITY
+
+
+async def handle_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Step 2 of the conversation (triggered by tapping a quality button).
+
+    update.callback_query is the button tap event.
+    query.data is the string we attached to the button ("q_128" etc.)
+    query.answer() MUST be called to dismiss the loading spinner on the button.
+    query.edit_message_text() replaces the "What quality?" message in-place.
+    """
+    query = update.callback_query
+    await query.answer()  # always required — dismisses Telegram's loading state
+
+    quality_key = query.data  # e.g. "q_128", "q_192", "q_320"
+    label, _ = QUALITY_OPTIONS.get(quality_key, ("192 kbps", "4"))
+
+    # Edit the quality prompt message to remove the buttons and show status
+    await query.edit_message_text(f"Got it — extracting at *{label}*…", parse_mode="Markdown")
+
+    # Retrieve the video path we stored in step 1
+    video_path_str = context.user_data.pop("pending_video", None)
+    context.user_data.pop("pending_source", None)
+
+    if not video_path_str:
+        await query.message.reply_text("⚠️ Something went wrong — please send the video again.")
+        return ConversationHandler.END
+
+    video_path = Path(video_path_str)
+    if not video_path.exists():
+        await query.message.reply_text("⚠️ The video file expired — please send it again.")
+        return ConversationHandler.END
+
+    await extract_and_send(
+        video_path,
+        query.message,
+        quality_key=quality_key,
+    )
+
+    return ConversationHandler.END  # conversation is over
+
+
+async def handle_quality_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Called if the user never taps a quality button.
+    We clean up the downloaded file so it doesn't sit in /tmp forever.
+    """
+    video_path_str = context.user_data.pop("pending_video", None)
+    if video_path_str:
+        Path(video_path_str).unlink(missing_ok=True)
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "⏰ Quality selection timed out. Send the video again when you're ready."
+        )
+    return ConversationHandler.END
+
+
+# ── Non-conversation handlers (trim, metadata) ────────────────────────────────
 
 async def trim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -293,7 +426,8 @@ async def trim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await extract_and_send(
         video_path, msg,
-        caption=f"Trimmed `{start_ts}` → `{end_ts}` 🎵",
+        quality_key="q_192",  # trim always uses 192kbps default
+        caption_suffix=f" — trimmed `{start_ts}` → `{end_ts}`",
         start_ts=start_ts,
         end_ts=end_ts,
     )
@@ -326,34 +460,61 @@ async def metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main() -> None:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # ── ConversationHandler ───────────────────────────────────────────────────
+    #
+    # entry_points  → what triggers the start of a conversation
+    # states        → a dict mapping each state to its handler(s)
+    # fallbacks     → what handles messages that don't match the current state
+    # conversation_timeout → seconds before handle_quality_timeout is called
+    #
+    # IMPORTANT: the ConversationHandler must be added BEFORE the plain
+    # MessageHandlers, because PTB checks handlers in registration order.
+    # If we registered the plain VIDEO handler first, it would intercept
+    # the video before the ConversationHandler ever sees it.
+    #
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video),
+            MessageHandler(filters.TEXT & filters.Regex(URL_PATTERN), handle_url),
+        ],
+        states={
+            AWAITING_QUALITY: [
+                # Only fires when the user is in AWAITING_QUALITY state
+                # and taps a button whose data starts with "q_"
+                CallbackQueryHandler(handle_quality, pattern=r"^q_"),
+            ],
+        },
+        fallbacks=[
+            # If the user sends anything else while we're waiting for a
+            # quality tap, gently remind them what we need
+            MessageHandler(
+                filters.ALL,
+                lambda u, c: u.effective_message.reply_text(
+                    "👆 Please tap one of the quality buttons above first."
+                ),
+            )
+        ],
+        conversation_timeout=120,  # 2 minutes to tap a button, then cleanup
+    )
+
+    app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("trim", trim))
     app.add_handler(CommandHandler("metadata", metadata))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(URL_PATTERN), handle_url))
 
     logger.info("Starting webhook on port %s → %s", PORT, WEBHOOK_URL)
 
     async with app:
         await app.start()
-
-        # start_webhook handles setWebhook with Telegram AND starts the
-        # Tornado HTTP server — we must NOT call set_webhook() separately
-        # or Telegram will receive two rapid calls and rate-limit us (429)
         await app.updater.start_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=WEBHOOK_PATH,
-            webhook_url=WEBHOOK_URL,   # PTB passes this to Telegram's setWebhook
+            webhook_url=WEBHOOK_URL,
             allowed_updates=Update.ALL_TYPES,
         )
-
         logger.info("Bot is live ✅")
-
-        # Block here forever until Render stops the container
         await asyncio.Event().wait()
-
-        # Clean shutdown
         await app.updater.stop()
         await app.stop()
 
