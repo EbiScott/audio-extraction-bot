@@ -324,16 +324,6 @@ async def metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    """
-    Manually manage the application lifecycle so we control the event loop.
-
-    Why not run_webhook()?
-    ----------------------
-    run_webhook() internally calls asyncio.get_event_loop() which raises
-    RuntimeError on Python 3.10+ when no loop exists yet in the main thread.
-    Instead we use asyncio.run(main()) which creates and owns the loop,
-    then we call the lower-level start/stop methods directly.
-    """
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -345,28 +335,28 @@ async def main() -> None:
     logger.info("Starting webhook on port %s → %s", PORT, WEBHOOK_URL)
 
     async with app:
-        # Register our URL with Telegram
-        await app.bot.set_webhook(
-            url=WEBHOOK_URL,
-            allowed_updates=Update.ALL_TYPES,
-        )
-        # Start the Tornado HTTP server + the PTB dispatcher
+        await app.start()
+
+        # start_webhook handles setWebhook with Telegram AND starts the
+        # Tornado HTTP server — we must NOT call set_webhook() separately
+        # or Telegram will receive two rapid calls and rate-limit us (429)
         await app.updater.start_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=WEBHOOK_PATH,
+            webhook_url=WEBHOOK_URL,   # PTB passes this to Telegram's setWebhook
+            allowed_updates=Update.ALL_TYPES,
         )
-        await app.start()
 
-        logger.info("Bot is live. Waiting for updates…")
+        logger.info("Bot is live ✅")
 
-        # Keep running until the process is killed (e.g. Render stops it)
+        # Block here forever until Render stops the container
         await asyncio.Event().wait()
 
-        # Graceful shutdown
+        # Clean shutdown
         await app.updater.stop()
         await app.stop()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())  # This creates the event loop — no more RuntimeError
+    asyncio.run(main())
